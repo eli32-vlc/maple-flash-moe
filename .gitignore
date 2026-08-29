@@ -145,3 +145,9 @@ maple-2bit-mlx/
 # Local experiment artifacts
 *.bin
 checkpoints/
+
+# Blog post source (published via the Hugo site in fuzzing-uk/)
+BLOG.md
+
+# Hugo blog site (separate git repo, lives inside this working tree)
+/fuzzing-uk/
