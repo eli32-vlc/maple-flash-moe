@@ -861,9 +861,9 @@ class FlashMoE:
 
     def __init__(
         self,
-        active: int = 8,
+        active: int = 16,
         shared: int = 0,
-        reselect_every: int = 1,
+        reselect_every: int = 32,
         enabled: bool = True,
     ):
         if active < 8:
@@ -904,9 +904,9 @@ class FlashMoE:
 
 def prepare_flash_moe(
     model,
-    active: int = 8,
-    shared: int = 2,
-    reselect_every: int = 256,
+    active: int = 16,
+    shared: int = 0,
+    reselect_every: int = 32,
     enabled: bool = True,
     model_path: Optional[str] = None,
 ):

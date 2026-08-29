@@ -1924,9 +1924,9 @@ def main():
     parser.add_argument(
         "--active-experts",
         type=int,
-        default=8,
+        default=16,
         help="flash-moe: total activated experts resident per MoE layer (must be >= 8). "
-        "Default: 8.",
+        "Default: 16.",
     )
     parser.add_argument(
         "--shared-experts",
@@ -1937,7 +1937,7 @@ def main():
     parser.add_argument(
         "--reselect-every",
         type=int,
-        default=1,
+        default=32,
         help="flash-moe: reselect the routed experts every N generated tokens (0 = never). "
         "Default: 256.",
     )

@@ -79,20 +79,21 @@ How it works:
   never materialized.
 - **IFP (Inactive-Expert-Free Policy).** The gating function is masked to the
   active set, so only resident experts are ever scored.
-- **Per-token reselect.** The active set is recomputed from the *current token's*
-  true top-k routing (default every token via `--reselect-every 1`). A small LRU
-  buffer in `_flash_page` keeps recently-used experts warm across tokens.
+- **Periodic reselect.** The active set is recomputed from the current routing
+  every `--reselect-every` tokens (default `32`). Reselecting every single token
+  re-reads ~100 MB of experts from disk per token; a longer interval cuts
+  decode-time disk reads ~32× while the resident set (default `--active-experts
+  16`) covers routing drift between reselects.
 - **Fused projections.** The checkpoint stores unfused `up_proj`/`gate_proj` plus
   a per-row `row_alpha`; the reader concatenates the two source rows per active
   expert and expands `row_alpha` to per-group scales/biases (BF16, bit-reinterpreted).
 
 ### Lossless at the default
 
-With `--active-experts 8 --shared-experts 0` and per-token decode, the active set
-*is* the model's true top-8 routing, so generated tokens are **bit-exact** vs the
-full model (verified: weight/scales/biases max diff = 0.0). Larger
-`--active-experts` trades a little quality for headroom; `--active-experts 256`
-reproduces the full model exactly.
+With per-token decode, the active set is the model's true top-k routing, so
+generated tokens are **bit-exact** vs the full model (verified:
+weight/scales/biases max diff = 0.0). Larger `--active-experts` trades a little
+quality for headroom; `--active-experts 256` reproduces the full model exactly.
 
 > Prefill note: during batch prefill every token routes to its own top-k set, so
 > the union of experts can far exceed `active`. The prefill pass keeps that full
@@ -103,7 +104,8 @@ reproduces the full model exactly.
 | config | peak RAM | notes |
 | --- | --- | --- |
 | full (no flash) | ~5.9–6.5 GB | baseline |
-| `--flash-moe --active-experts 8 --shared-experts 0` | **0.63 GB** | lossless (top-8 routing) |
+| `--flash-moe --active-experts 16 --shared-experts 0` | **0.72 GB** | default; fast decode (~32× fewer disk reads) |
+| `--flash-moe --active-experts 8 --shared-experts 0` | 0.63 GB | lossless top-8 routing, slower (per-token reselect) |
 | `--flash-moe --active-experts 32 --shared-experts 2` | 0.94 GB | coherent, slight quality cost |
 | `--flash-moe --active-experts 256` | 5.89 GB | equals full model |
 
@@ -112,18 +114,21 @@ reproduces the full model exactly.
 
 > Note on `--shared-experts`: quality loss is zero whenever
 > `active >= top_k + shared`. Since Maple's `top_k = 8`, keep `--shared-experts 0`
-> at the default `active = 8`, or raise `--active-experts` above 8 if you enable
+> at the default `active = 16`, or raise `--active-experts` above 8 if you enable
 > shared experts.
 
 ### Run with flash-MoE
 
+Defaults are already tuned for speed (`--active-experts 16 --reselect-every 32`);
+flags shown for reference.
+
 ```sh
 python -m mlx_lm generate --model ./maple-2bit-mlx --trust-remote-code \
-  --flash-moe --active-experts 8 --shared-experts 0 \
+  --flash-moe --active-experts 16 --reselect-every 32 \
   --prompt "Write a haiku about a grove." --temp 0.7 --top-p 0.9 --top-k 40
 
 python -m mlx_lm chat --model ./maple-2bit-mlx --trust-remote-code \
-  --flash-moe --active-experts 8 --kv-bits 8 --kv-v-bits 4 --max-tokens -1
+  --flash-moe --kv-bits 8 --kv-v-bits 4 --max-tokens -1
 ```
 
 ## KV cache quantization
@@ -143,10 +148,13 @@ supports every flash-MoE / KV-quant flag:
 
 ```sh
 python -m mlx_lm server --model ./maple-2bit-mlx --trust-remote-code \
-  --flash-moe --active-experts 8 --shared-experts 0 \
+  --flash-moe \
   --kv-bits 8 --kv-v-bits 4 \
   --port 8080 --prefill-step-size 8192 --max-tokens 8192
 ```
+
+flash-MoE defaults are already speed-tuned (`--active-experts 16
+--reselect-every 32`); pass flags to override.
 
 It logs live progress: prefill percentage + tok/s, and per-phase
 `Prompt: N tokens, X tok/s` / `Generation: N tokens, Y tok/s`.
