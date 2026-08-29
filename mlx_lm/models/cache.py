@@ -261,7 +261,7 @@ class QuantizedKVCache(_BaseCache):
                     mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
                 )
 
-            def expand_quant(x, el_per_int):
+            def expand_quant(x):
                 new_x = mx.zeros((*shape, x.shape[-1]), dtype=x.dtype)
                 return mx.concatenate([x, new_x], axis=-2)
 
@@ -562,7 +562,9 @@ class RotatingKVCache(_BaseCache):
         self._idx -= n
         return n
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 4, k_bits: int = None, v_bits: int = None
+    ) -> QuantizedKVCache:
         raise NotImplementedError("RotatingKVCache Quantization NYI")
 
     def make_mask(
@@ -1354,7 +1356,9 @@ class BatchRotatingKVCache(_BaseCache):
         self.offset -= n
         return n
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+    def to_quantized(
+        self, group_size: int = 64, bits: int = 4, k_bits: int = None, v_bits: int = None
+    ) -> QuantizedKVCache:
         raise NotImplementedError("BatchRotatingKVCache Quantization NYI")
 
     def make_mask(

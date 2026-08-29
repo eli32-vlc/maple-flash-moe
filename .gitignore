@@ -146,6 +146,9 @@ maple-2bit-mlx/
 *.bin
 checkpoints/
 
+# Local stress-test harness
+stress_32k.py
+
 # Blog post source (published via the Hugo site in fuzzing-uk/)
 BLOG.md
 

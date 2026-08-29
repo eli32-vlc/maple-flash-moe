@@ -12,8 +12,8 @@ library in the coming days.
 Requires Apple Silicon and [uv](https://docs.astral.sh/uv/).
 
 ```sh
-git clone git@github.com:deepgrove-ai/mlx-lm-deepgrove.git
-cd mlx-lm-deepgrove
+git clone git@github.com:eli32-vlc/maple-flash-moe.git
+cd maple-flash-moe
 ./setup.sh
 source .venv/bin/activate
 hf download deepgrove/maple-2bit-mlx --local-dir maple-2bit-mlx
@@ -94,6 +94,9 @@ quality for headroom; `--active-experts 256` reproduces the full model exactly.
 | `--flash-moe --active-experts 8 --shared-experts 0` | **0.63 GB** | lossless (top-8 routing) |
 | `--flash-moe --active-experts 32 --shared-experts 2` | 0.94 GB | coherent, slight quality cost |
 | `--flash-moe --active-experts 256` | 5.89 GB | equals full model |
+
+> All flash-MoE memory numbers measured on a MacBook Air (Apple M2, 16 GB
+> unified memory, stock MLX build).
 
 > Note on `--shared-experts`: quality loss is zero whenever
 > `active >= top_k + shared`. Since Maple's `top_k = 8`, keep `--shared-experts 0`
