@@ -21,6 +21,11 @@ hf download deepgrove/maple-2bit-mlx --local-dir maple-2bit-mlx
 
 ## Run
 
+This fork ships its own `maple.py` implementation, so it takes precedence over
+any `model_file` baked into a checkpoint — you always run the fixed code here,
+even against older `deepgrove/maple-2bit-mlx` snapshots. `--trust-remote-code`
+is therefore optional.
+
 ```sh
 python -m mlx_lm generate --model ./maple-2bit-mlx --trust-remote-code --flash-head \
   --prompt "Write a haiku about a grove." --temp 1.0 --top-p 0.95 --top-k 20

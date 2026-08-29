@@ -341,21 +341,29 @@ def load_model(
     for wf in weight_files:
         weights.update(mx.load(wf))
 
+    # Prefer this fork's implementation whenever it supports the model type, so
+    # users always run the fixed code (e.g. the flash-MoE `_select` fix) rather
+    # than a stale `model_file` copy baked into an old checkpoint. Only fall
+    # back to the checkpoint's custom module for model types this fork does not
+    # implement natively.
     if (model_file := config.get("model_file")) is not None:
-        if not trust_remote_code:
-            raise ValueError(
-                f"The model at {model_path} requires importing and running a "
-                f"custom module ({model_file!r}) to build its architecture. This "
-                "is disabled by default. Pass trust_remote_code=True if you "
-                "trust this model."
+        try:
+            model_class, model_args_class = get_model_classes(config=config)
+        except ValueError:
+            if not trust_remote_code:
+                raise ValueError(
+                    f"The model at {model_path} requires importing and running a "
+                    f"custom module ({model_file!r}) to build its architecture. This "
+                    "is disabled by default. Pass trust_remote_code=True if you "
+                    "trust this model."
+                )
+            spec = importlib.util.spec_from_file_location(
+                "custom_model",
+                model_path / model_file,
             )
-        spec = importlib.util.spec_from_file_location(
-            "custom_model",
-            model_path / model_file,
-        )
-        arch = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(arch)
-        model_class, model_args_class = arch.Model, arch.ModelArgs
+            arch = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(arch)
+            model_class, model_args_class = arch.Model, arch.ModelArgs
     else:
         model_class, model_args_class = get_model_classes(config=config)
 
