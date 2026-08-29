@@ -795,7 +795,12 @@ class MapleSparseMoeBlock(nn.Module):
                 unique_ids.append(e)
         shared = [int(s) for s in fm.shared_ids]
         active = list(dict.fromkeys(shared + unique_ids))
-        if len(active) > fm.active:
+        # During batch prefill, each token routes to its own top-k set, so the
+        # union can far exceed `active`. Capping it then pushes the entire batch
+        # through a wrong expert subset and corrupts prefill / the KV cache.
+        # Only cap for single-token decode, where union == top_k == active, so
+        # the cap is lossless (bit-exact baseline routing).
+        if len(active) > fm.active and x.shape[1] == 1:
             active = active[: fm.active]
         active = mx.array(active, dtype=mx.int32)
         self.switch_mlp.set_active(active)

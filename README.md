@@ -83,10 +83,17 @@ How it works:
 
 ### Lossless at the default
 
-With `--active-experts 8 --shared-experts 0` the active set *is* the model's true
-top-8 routing, so output is **bit-exact** vs the full model (verified:
-weight/scales/biases max diff = 0.0). Larger `--active-experts` trades a little
-quality for headroom; `--active-experts 256` reproduces the full model exactly.
+With `--active-experts 8 --shared-experts 0` and per-token decode, the active set
+*is* the model's true top-8 routing, so generated tokens are **bit-exact** vs the
+full model (verified: weight/scales/biases max diff = 0.0). Larger
+`--active-experts` trades a little quality for headroom; `--active-experts 256`
+reproduces the full model exactly.
+
+> Prefill note: during batch prefill every token routes to its own top-k set, so
+> the union of experts can far exceed `active`. The prefill pass keeps that full
+> union resident (only decode caps to `--active-experts`), which is what makes
+> prefill exact; resident memory at generation time is still bounded by the
+> activated set.
 
 | config | peak RAM | notes |
 | --- | --- | --- |
