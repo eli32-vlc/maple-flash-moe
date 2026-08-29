@@ -29,7 +29,8 @@ is therefore optional.
 ### Best quality (recommended)
 
 Flash-MoE with exactly the model's top-8 routing (`--active-experts 8`) and no
-expert reselect during decode gives the highest quality at ~0.63 GB resident:
+expert reselect during decode (`--reselect-every 0`) gives the highest quality
+at ~0.63 GB resident:
 
 ```sh
 python -m mlx_lm server --model ./maple-2bit-mlx --trust-remote-code --flash-moe \
@@ -37,10 +38,19 @@ python -m mlx_lm server --model ./maple-2bit-mlx --trust-remote-code --flash-moe
   --kv-bits 8 --kv-v-bits 4 --port 8080
 ```
 
-> `--reselect-every 0` keeps the expert set fixed after prefill — best quality,
-> at the cost of per-token expert reselect reads. If you want faster decode,
-> the defaults (`--active-experts 16 --reselect-every 32`) are already speed
-> tuned.
+### Fastest decode
+
+Reselecting experts less often cuts the ~100 MB/token of expert disk reads.
+`--active-experts 16 --reselect-every 32` is a good speed/quality balance
+(~32× fewer decode-time reads):
+
+```sh
+python -m mlx_lm server --model ./maple-2bit-mlx --trust-remote-code --flash-moe \
+  --active-experts 16 --reselect-every 32 \
+  --kv-bits 8 --kv-v-bits 4 --port 8080
+```
+
+### Single-shot / interactive
 
 ```sh
 python -m mlx_lm generate --model ./maple-2bit-mlx --trust-remote-code --flash-head \
@@ -54,7 +64,7 @@ Enable flash head for extra speed.
 ```sh
 python -m mlx_lm chat --model ./maple-2bit-mlx --trust-remote-code --max-tokens -1 \
   --temp 1.0 --top-p 0.95 --flash-head
-``` 
+```
 
 | chip | head | decode tok/s | prefill tok/s | peak |
 | --- | --- | --- | --- | --- |
@@ -62,6 +72,31 @@ python -m mlx_lm chat --model ./maple-2bit-mlx --trust-remote-code --max-tokens 
 | M4 | `--flash-head` | **218** | 1075 | 6.69 GB |
 | M5 Pro | exact (default) | 359 | 3773 | 6.73 GB |
 | M5 Pro | `--flash-head` | **395** | 3857 | 6.92 GB |
+
+### Tuning guide
+
+The flash-MoE flags trade memory, decode speed, and quality. Maple routes each
+token through its top-8 of 256 experts; flash-MoE keeps only an *active* subset
+resident in DRAM and streams the rest from disk.
+
+| knob | default | lower | higher |
+| --- | --- | --- | --- |
+| `--active-experts` | 8 | not below 8 (must be ≥ top-k) | more resident experts → fewer disk reads → faster decode; `256` = full model in RAM (~5.9 GB) |
+| `--reselect-every` | 1 | 0 = keep the set fixed after prefill → best quality | N → reselect every N tokens → ~N× fewer disk reads, routing grows stale between reselects |
+| `--shared-experts` | 0 | 0 (keep, quality is lossless while `active ≥ top_k + shared`) | fixed always-resident experts, useful once you raise `--active-experts` |
+| `--kv-bits` / `--kv-v-bits` | none (fp16 KV) | 8/4 recommended; 4/4 smallest KV | 8/8 or none → better KV fidelity, more RAM |
+| `--prefill-step-size` | 2048 | less RAM per prefill step | 8192 → faster prefill on long prompts |
+| `--max-tokens` | 256 | — | keep high (e.g. 64000); this model's reasoning block needs room or replies come back empty |
+| `--temp` | 0 | 0 = greedy, **loops/degenerates on 2-bit weights** | more variety but more drift; 0.5–0.8 is the sweet spot |
+| `--top-p` | 1.0 | 0.9 tighter/coherent | closer to 1.0 more varied |
+| `--top-k` | 0 (off) | 20–40 guards against garbage tokens | off/higher more freedom |
+| `--min-p` | 0 | 0.05 recommended anti-repetition floor | higher (0.1–0.2) kills repetition, can over-restrict |
+
+Quick fixes:
+- **Off-topic drift / repetition** → raise `--min-p` (0.1–0.2), lower `--temp` (0.5–0.6), lower `--top-k` (20).
+- **Too slow** → raise `--active-experts` or `--reselect-every`; drop `--flash-moe` if RAM allows.
+- **OOM on long prompts** → lower `--kv-bits`/`--kv-v-bits`, lower `--prefill-step-size`.
+- **Empty replies** → `--max-tokens` is too low for the reasoning block.
 
 ## Convert
 
@@ -95,21 +130,22 @@ How it works:
   never materialized.
 - **IFP (Inactive-Expert-Free Policy).** The gating function is masked to the
   active set, so only resident experts are ever scored.
-- **Periodic reselect.** The active set is recomputed from the current routing
-  every `--reselect-every` tokens (default `32`). Reselecting every single token
-  re-reads ~100 MB of experts from disk per token; a longer interval cuts
-  decode-time disk reads ~32× while the resident set (default `--active-experts
-  16`) covers routing drift between reselects.
+- **Per-token reselect.** The active set is recomputed from the *current token's*
+  true top-k routing (default every token via `--reselect-every 1`). A small LRU
+  buffer in `_flash_page` keeps recently-used experts warm across tokens.
+  `--reselect-every 0` keeps the set fixed after prefill (best quality, slower);
+  a larger interval (e.g. 32) cuts the ~100 MB/token of expert disk reads ~N×.
 - **Fused projections.** The checkpoint stores unfused `up_proj`/`gate_proj` plus
   a per-row `row_alpha`; the reader concatenates the two source rows per active
   expert and expands `row_alpha` to per-group scales/biases (BF16, bit-reinterpreted).
 
 ### Lossless at the default
 
-With per-token decode, the active set is the model's true top-k routing, so
-generated tokens are **bit-exact** vs the full model (verified:
-weight/scales/biases max diff = 0.0). Larger `--active-experts` trades a little
-quality for headroom; `--active-experts 256` reproduces the full model exactly.
+With `--active-experts 8 --shared-experts 0` and per-token decode, the active set
+*is* the model's true top-8 routing, so generated tokens are **bit-exact** vs the
+full model (verified: weight/scales/biases max diff = 0.0). Larger
+`--active-experts` trades a little quality for headroom; `--active-experts 256`
+reproduces the full model exactly.
 
 > Prefill note: during batch prefill every token routes to its own top-k set, so
 > the union of experts can far exceed `active`. The prefill pass keeps that full
@@ -120,8 +156,7 @@ quality for headroom; `--active-experts 256` reproduces the full model exactly.
 | config | peak RAM | notes |
 | --- | --- | --- |
 | full (no flash) | ~5.9–6.5 GB | baseline |
-| `--flash-moe --active-experts 16 --shared-experts 0` | **0.72 GB** | default; fast decode (~32× fewer disk reads) |
-| `--flash-moe --active-experts 8 --shared-experts 0` | 0.63 GB | lossless top-8 routing, slower (per-token reselect) |
+| `--flash-moe --active-experts 8 --shared-experts 0` | **0.63 GB** | lossless (top-8 routing) |
 | `--flash-moe --active-experts 32 --shared-experts 2` | 0.94 GB | coherent, slight quality cost |
 | `--flash-moe --active-experts 256` | 5.89 GB | equals full model |
 
@@ -130,21 +165,18 @@ quality for headroom; `--active-experts 256` reproduces the full model exactly.
 
 > Note on `--shared-experts`: quality loss is zero whenever
 > `active >= top_k + shared`. Since Maple's `top_k = 8`, keep `--shared-experts 0`
-> at the default `active = 16`, or raise `--active-experts` above 8 if you enable
+> at the default `active = 8`, or raise `--active-experts` above 8 if you enable
 > shared experts.
 
 ### Run with flash-MoE
 
-Defaults are already tuned for speed (`--active-experts 16 --reselect-every 32`);
-flags shown for reference.
-
 ```sh
 python -m mlx_lm generate --model ./maple-2bit-mlx --trust-remote-code \
-  --flash-moe --active-experts 16 --reselect-every 32 \
+  --flash-moe --active-experts 8 --shared-experts 0 \
   --prompt "Write a haiku about a grove." --temp 0.7 --top-p 0.9 --top-k 40
 
 python -m mlx_lm chat --model ./maple-2bit-mlx --trust-remote-code \
-  --flash-moe --kv-bits 8 --kv-v-bits 4 --max-tokens -1
+  --flash-moe --active-experts 8 --kv-bits 8 --kv-v-bits 4 --max-tokens -1
 ```
 
 ## KV cache quantization
@@ -164,13 +196,10 @@ supports every flash-MoE / KV-quant flag:
 
 ```sh
 python -m mlx_lm server --model ./maple-2bit-mlx --trust-remote-code \
-  --flash-moe \
+  --flash-moe --active-experts 8 --shared-experts 0 \
   --kv-bits 8 --kv-v-bits 4 \
   --port 8080 --prefill-step-size 8192 --max-tokens 8192
 ```
-
-flash-MoE defaults are already speed-tuned (`--active-experts 16
---reselect-every 32`); pass flags to override.
 
 It logs live progress: prefill percentage + tok/s, and per-phase
 `Prompt: N tokens, X tok/s` / `Generation: N tokens, Y tok/s`.
