@@ -26,6 +26,22 @@ any `model_file` baked into a checkpoint — you always run the fixed code here,
 even against older `deepgrove/maple-2bit-mlx` snapshots. `--trust-remote-code`
 is therefore optional.
 
+### Best quality (recommended)
+
+Flash-MoE with exactly the model's top-8 routing (`--active-experts 8`) and no
+expert reselect during decode gives the highest quality at ~0.63 GB resident:
+
+```sh
+python -m mlx_lm server --model ./maple-2bit-mlx --trust-remote-code --flash-moe \
+  --active-experts 8 --reselect-every 0 \
+  --kv-bits 8 --kv-v-bits 4 --port 8080
+```
+
+> `--reselect-every 0` keeps the expert set fixed after prefill — best quality,
+> at the cost of per-token expert reselect reads. If you want faster decode,
+> the defaults (`--active-experts 16 --reselect-every 32`) are already speed
+> tuned.
+
 ```sh
 python -m mlx_lm generate --model ./maple-2bit-mlx --trust-remote-code --flash-head \
   --prompt "Write a haiku about a grove." --temp 1.0 --top-p 0.95 --top-k 20
