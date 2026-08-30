@@ -218,6 +218,13 @@ def setup_arg_parser():
         help="flash-moe: reselect the routed experts every N generated tokens (0 = never).",
     )
     parser.add_argument(
+        "--moe-cache-size",
+        type=int,
+        default=0,
+        help="flash-moe: size of the shared LRU expert slot cache (FreeToken-style). "
+        "0 disables it and uses the legacy per-layer active-set path.",
+    )
+    parser.add_argument(
         "--kv-group-size",
         type=int,
         help="Group size for KV cache quantization.",
@@ -2174,6 +2181,7 @@ def main():
             shared=args.shared_experts,
             reselect_every=args.reselect_every,
             model_path=model_path,
+            cache_size=args.moe_cache_size,
         )
 
     for eos_token in args.extra_eos_token:

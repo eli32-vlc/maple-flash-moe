@@ -270,5 +270,69 @@ class TestMapleKernels(unittest.TestCase):
         self.assertTrue(mx.array_equal(grouped[f"{prefix}.scales"], scales))
 
 
+class TestExpertSlotCache(unittest.TestCase):
+    """Correctness of the shared LRU expert slot cache (FreeToken-style)."""
+
+    def _make_cache(self, num_layers=1, num_experts=4, num_slots=16, out_dim=8, packed=4):
+        from mlx_lm.models.switch_layers import ExpertSlotCache
+
+        cache = ExpertSlotCache(num_layers, num_experts, num_slots)
+        cache.register_bank("up_gate", out_dim, packed, mx.uint32, group_size=128)
+        cache.register_bank("down", out_dim, packed, mx.uint32, group_size=128)
+
+        class _Disk:
+            index = {}
+
+            def read(self, key, ids):
+                seed = hash(key) & 0xFFFF
+                rng = np.random.default_rng(seed)
+                if key.endswith(".alpha"):
+                    return mx.array(
+                        rng.random((len(ids), out_dim), dtype=np.float32),
+                        dtype=mx.bfloat16,
+                    )
+                return mx.array(
+                    rng.integers(0, 3, size=(len(ids), out_dim, packed), dtype=np.uint32)
+                )
+
+        cache.disk = _Disk()
+        for l in range(num_layers):
+            cache.register_layer(
+                l,
+                [f"l{l}.up.weight"],
+                [f"l{l}.up.alpha"],
+                [f"l{l}.down.weight"],
+                [f"l{l}.down.alpha"],
+            )
+        return cache
+
+    def test_resolve_pages_in_and_is_stable(self):
+        cache = self._make_cache()
+        ids = mx.array([1, 2, 3, 2], dtype=mx.int32)
+        s1 = cache.resolve(0, ids)
+        self.assertEqual(s1.tolist(), [0, 1, 2, 1])  # distinct experts -> distinct slots
+        s2 = cache.resolve(0, ids)
+        self.assertEqual(s1.tolist(), s2.tolist())  # stable across calls
+
+    def test_resolve_evicts_least_recently_used(self):
+        cache = self._make_cache(num_experts=4, num_slots=2)
+        cache.resolve(0, mx.array([0, 1], dtype=mx.int32))
+        cache.resolve(0, mx.array([2, 3], dtype=mx.int32))  # evicts 0/1
+        # 0 must be re-paged in (never -1) and 2/3 must still be resident.
+        s0 = cache.resolve(0, mx.array([0], dtype=mx.int32))
+        self.assertNotEqual(s0.tolist(), [-1])
+        s23 = cache.resolve(0, mx.array([2, 3], dtype=mx.int32))
+        self.assertNotIn(-1, s23.tolist())
+
+    def test_weights_match_source(self):
+        cache = self._make_cache()
+        cache.resolve(0, mx.array([1], dtype=mx.int32))
+        slot = int(cache.slot_for_id[1].item())
+        w_bank = cache._bank["up_gate"][0][slot]
+        want = cache.disk.read("l0.up.weight", [1])[0]
+        mx.eval(w_bank, want)
+        self.assertTrue(mx.array_equal(w_bank, want))
+
+
 if __name__ == "__main__":
     unittest.main()

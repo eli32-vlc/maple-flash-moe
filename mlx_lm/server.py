@@ -379,6 +379,7 @@ class ModelProvider:
                 shared=self.cli_args.shared_experts,
                 reselect_every=self.cli_args.reselect_every,
                 model_path=model_path,
+                cache_size=getattr(self.cli_args, "moe_cache_size", 0),
             )
         self.is_batchable = is_batchable
 
@@ -1940,6 +1941,13 @@ def main():
         default=1,
         help="flash-moe: reselect the routed experts every N generated tokens (0 = never). "
         "Default: 256.",
+    )
+    parser.add_argument(
+        "--moe-cache-size",
+        type=int,
+        default=0,
+        help="flash-moe: size of the shared LRU expert slot cache (FreeToken-style). "
+        "0 disables it and uses the legacy per-layer active-set path.",
     )
     args = parser.parse_args()
     if mx.metal.is_available():

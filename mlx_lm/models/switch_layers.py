@@ -88,23 +88,178 @@ class _DiskHolder:
 
     def __init__(self):
         self.index = None
+        self._maps = {}
+
+    def _mmap(self, fp):
+        import mmap as _mmap
+
+        m = self._maps.get(fp)
+        if m is None:
+            with open(fp, "rb") as f:
+                m = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
+            self._maps[fp] = m
+        return m
 
     def read(self, sf_key, ids):
         fp, abs_off, dt_str, shape = self.index[sf_key]
         np_dt, mlx_dt = _SAFETENSORS_DTYPE[dt_str]
         row_elems = int(np.prod(shape[1:]))
         row_bytes = row_elems * np.dtype(np_dt).itemsize
+        mm = self._mmap(fp)
         out = np.empty((len(ids), *shape[1:]), dtype=np_dt)
-        with open(fp, "rb") as f:
-            for i, e in enumerate(ids):
-                f.seek(abs_off + int(e) * row_bytes)
-                f.readinto(out[i].reshape(-1))
+        for i, e in enumerate(ids):
+            off = abs_off + int(e) * row_bytes
+            row = np.frombuffer(mm, dtype=np_dt, count=row_elems, offset=off)
+            out[i].reshape(-1)[:] = row
         if mlx_dt == mx.bfloat16:
             # Reinterpret the 16-bit patterns as bfloat16 (bf16 == top half of
             # float32) rather than casting the integer bit values.
             out = (out.astype(np.uint32) << 16).view(np.float32)
             return mx.array(out, dtype=mx.float32).astype(mx.bfloat16)
         return mx.array(out, dtype=mlx_dt)
+
+
+class ExpertSlotCache:
+    """FreeToken-style global LRU expert cache shared across MoE layers.
+
+    One slot pool serves every layer: a slot holds one expert's fused up+gate
+    row *and* its down row (same slot id, two banks with different out dims).
+    Routing rewrites expert ids to slot ids via ``slot_for_id``; ``resolve``
+    pages in missing experts from disk, evicting the least-recently-used slot
+    (timestamp LRU). Hits touch no disk at all, so recurring experts stay hot
+    across tokens and layers.
+
+    The cache owns the disk holder; per layer it knows the fused up_gate and
+    down source key sets. Both projections of a layer share the same routing,
+    so paging in one (layer, expert) fills both banks.
+    """
+
+    def __init__(self, num_layers: int, num_experts: int, num_slots: int):
+        self.num_layers = num_layers
+        self.num_experts = num_experts
+        self.num_slots = num_slots
+        self.disk = _DiskHolder()
+        self.disk.index = None
+        # (layer, expert) -> slot ; slot -> (layer, expert) ; LRU timestamps.
+        self.slot_for_id = mx.full((num_layers * num_experts,), -1, dtype=mx.int32)
+        self.id_of_slot = mx.full((num_slots,), -1, dtype=mx.int32)
+        self.usage = mx.zeros((num_slots,), dtype=mx.int32)
+        self._step = 0
+        # Per-layer source keys, set by register_layer.
+        self._src = {}
+        # Banks: name -> (weight, scales, biases) mx arrays of (num_slots, ...).
+        self._bank = {}
+        self._ngroups = {}
+        self._call_cache = {}
+
+    def set_file_index(self, file_index):
+        self.disk.index = file_index
+
+    def register_layer(self, layer_id, up_keys, up_alpha_keys, down_keys, down_alpha_keys):
+        self._src[layer_id] = (
+            up_keys,
+            up_alpha_keys,
+            down_keys,
+            down_alpha_keys,
+        )
+
+    def register_bank(self, name, out_dim, packed, dtype, group_size):
+        ngroups = packed * 16 // group_size
+        self._ngroups[name] = (ngroups, group_size)
+        self._bank[name] = (
+            mx.zeros((self.num_slots, out_dim, packed), dtype=dtype),
+            mx.zeros((self.num_slots, out_dim, ngroups), dtype=mx.bfloat16),
+            mx.zeros((self.num_slots, out_dim, ngroups), dtype=mx.bfloat16),
+        )
+
+    def bank(self, name):
+        return self._bank[name]
+
+    def _fill_slot(self, layer_id, eid, slot):
+        up_keys, up_alpha, down_keys, down_alpha = self._src[layer_id]
+        ngroups_up, _ = self._ngroups["up_gate"]
+        ngroups_dn, _ = self._ngroups["down"]
+
+        w_up = [self.disk.read(k, [eid]) for k in up_keys]
+        w_up = mx.concatenate(w_up, axis=1) if len(w_up) > 1 else w_up[0]
+        a_up = [self.disk.read(k, [eid]) for k in up_alpha]
+        a_up = mx.concatenate(a_up, axis=1) if len(a_up) > 1 else a_up[0]
+        s_up = mx.broadcast_to(a_up[..., None], (*a_up.shape, ngroups_up))
+
+        w_dn = [self.disk.read(k, [eid]) for k in down_keys]
+        w_dn = mx.concatenate(w_dn, axis=1) if len(w_dn) > 1 else w_dn[0]
+        a_dn = [self.disk.read(k, [eid]) for k in down_alpha]
+        a_dn = mx.concatenate(a_dn, axis=1) if len(a_dn) > 1 else a_dn[0]
+        s_dn = mx.broadcast_to(a_dn[..., None], (*a_dn.shape, ngroups_dn))
+
+        w_bank, s_bank, b_bank = self._bank["up_gate"]
+        w_bank[slot] = w_up[0]
+        s_bank[slot] = s_up[0]
+        b_bank[slot] = -s_up[0]
+        w_bank, s_bank, b_bank = self._bank["down"]
+        w_bank[slot] = w_dn[0]
+        s_bank[slot] = s_dn[0]
+        b_bank[slot] = -s_dn[0]
+
+    def _victim(self):
+        return int(mx.argmin(self.usage).item())
+
+    def _evict(self, slot):
+        fid = int(self.id_of_slot[slot].item())
+        if fid >= 0:
+            self.slot_for_id[fid] = -1
+        self.id_of_slot[slot] = -1
+
+    def _page_in(self, layer_id, eid):
+        slot = self._victim()
+        self._evict(slot)
+        self._fill_slot(layer_id, eid, slot)
+        fid = layer_id * self.num_experts + eid
+        self.id_of_slot[slot] = fid
+        self.slot_for_id[fid] = slot
+        self.usage[slot] = self._step
+        return slot
+
+    def resolve(self, layer_id, expert_ids):
+        flat = expert_ids.reshape(-1)
+        if layer_id == 0:
+            self._call_cache = {}
+        key = (layer_id, int(flat[0]) if flat.size else -1)
+        cached = self._call_cache.pop(key, None)
+        if cached is not None and cached[0].size == flat.size:
+            self._step += 1
+            slots = cached[0]
+            self.usage[slots] = self._step
+            return slots.reshape(expert_ids.shape)
+        base = layer_id * self.num_experts
+        slots = self.slot_for_id[base + flat]
+        self._step += 1
+        mx.eval(slots)
+        slots_np = np.asarray(slots.tolist(), dtype=np.int32).reshape(-1)
+        if np.any(slots_np < 0):
+            flat_np = np.asarray(flat.tolist(), dtype=np.int32).reshape(-1)
+            for i in range(flat_np.shape[0]):
+                if slots_np[i] < 0:
+                    e = int(flat_np[i])
+                    fid = base + e
+                    slot = int(self.slot_for_id[fid].item())
+                    if slot < 0:
+                        slot = self._page_in(layer_id, e)
+                    slots_np[i] = slot
+            slots = mx.array(slots_np, dtype=mx.int32)
+            mx.eval(
+                self.slot_for_id, self.id_of_slot, self.usage,
+                *self._bank["up_gate"], *self._bank["down"],
+            )
+        self.usage[slots] = self._step
+        self._call_cache = {key: (slots, None)}
+        return slots.reshape(expert_ids.shape)
+
+    def reset(self):
+        self.slot_for_id = mx.full((self.num_layers * self.num_experts,), -1, dtype=mx.int32)
+        self.id_of_slot = mx.full((self.num_slots,), -1, dtype=mx.int32)
+        self.usage = mx.zeros((self.num_slots,), dtype=mx.int32)
+        self._step = 0
 
 
 def _flash_init_resident(self, E, file_index, key_prefix, group_size=128):
@@ -263,6 +418,21 @@ class QuantizedSwitchLinear(nn.Module):
         return self.weight.shape[0]
 
     def __call__(self, x, indices, sorted_indices=False):
+        if getattr(self, "expert_cache", None) is not None:
+            indices = self.expert_cache.resolve(self.layer_id, indices)
+            w, s, b = self.expert_cache.bank(self.bank_name)
+            return mx.gather_qmm(
+                x,
+                w,
+                s,
+                b,
+                rhs_indices=indices,
+                transpose=True,
+                group_size=self.expert_cache._ngroups[self.bank_name][1],
+                bits=self.bits,
+                mode=self.mode,
+                sorted_indices=sorted_indices,
+            )
         if getattr(self, "cache_enabled", False):
             indices = _flash_resolve(self, indices)
             sorted_indices = False
@@ -281,6 +451,16 @@ class QuantizedSwitchLinear(nn.Module):
         if "bias" in self:
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x
+
+    def attach_cache(self, cache, layer_id: int, bank_name: str):
+        self.expert_cache = cache
+        self.layer_id = layer_id
+        self.bank_name = bank_name
+        # Drop the per-layer (num_experts, ...) tensors so load-time eval does
+        # not materialize the whole model; the cache banks hold resident rows.
+        for k in ("weight", "scales", "biases", "bias"):
+            if k in self:
+                self.__delattr__(k)
 
     def init_resident(self, E: int, file_index=None, key_prefix=None, group_size=128):
         _flash_init_resident(self, E, file_index, key_prefix, group_size)

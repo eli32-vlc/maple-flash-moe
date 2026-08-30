@@ -125,9 +125,10 @@ model sits at **~5.9–6.5 GB** on Apple Silicon. Flash-MoE keeps only a small
 How it works:
 
 - **File-backed checkpoint.** Expert weights stay on disk. A byte-range reader
-  (`_DiskHolder` in `mlx_lm/models/switch_layers.py`) seeks to and reads only the
-  rows for the currently-active experts via numpy — the full 256-expert tensor is
-  never materialized.
+  (`_DiskHolder` in `mlx_lm/models/switch_layers.py`) memory-maps the shards once
+  and slices only the currently-active expert rows via numpy — the full 256-expert
+  tensor is never materialized, and repeated rows are served from the OS page
+  cache instead of fresh `open()`/`seek()` syscalls.
 - **IFP (Inactive-Expert-Free Policy).** The gating function is masked to the
   active set, so only resident experts are ever scored.
 - **Per-token reselect.** The active set is recomputed from the *current token's*
@@ -138,6 +139,11 @@ How it works:
 - **Fused projections.** The checkpoint stores unfused `up_proj`/`gate_proj` plus
   a per-row `row_alpha`; the reader concatenates the two source rows per active
   expert and expands `row_alpha` to per-group scales/biases (BF16, bit-reinterpreted).
+- **Shared LRU expert cache (optional).** `--moe-cache-size N` (FreeToken-style)
+  replaces the per-layer resident set with one global slot pool shared across all
+  layers: routed experts are paged in on demand and evicted by LRU, so recurring
+  experts stay hot across tokens. Intended for memory-tight configs; the legacy
+  per-layer path (default) is faster on Apple Silicon.
 
 ### Lossless at the default
 

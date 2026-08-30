@@ -810,7 +810,7 @@ class MapleSparseMoeBlock(nn.Module):
 
     def __call__(self, x):
         fm = self.flash
-        if fm is not None and fm.enabled:
+        if fm is not None and fm.enabled and fm.cache is None:
             if not self._selected:
                 self._select(fm, x)
             else:
@@ -875,15 +875,21 @@ class FlashMoE:
         self.reselect_every = reselect_every
         self.enabled = enabled
         self.shared_ids = mx.arange(shared)
+        # Global LRU expert cache (FreeToken-style). When set, routing is left
+        # free (no IFP masking); the cache pages in routed experts on demand
+        # and keeps them hot across tokens/layers. ``None`` keeps the legacy
+        # per-layer active-set path.
+        self.cache = None
 
     def attach(self, model, model_path=None):
         if not self.enabled:
             return self
-        from mlx_lm.models.switch_layers import _build_file_index
+        from mlx_lm.models.switch_layers import ExpertSlotCache, _build_file_index
 
         index = _build_file_index(model_path) if model_path else None
         qcfg = getattr(getattr(model, "args", None), "quantization", None) or {}
         group_size = qcfg.get("group_size", 128)
+        cache = self.cache
         for l_idx, l in enumerate(model.layers):
             mlp = getattr(l, "mlp", None)
             # Duck-type rather than isinstance: when the checkpoint is loaded
@@ -897,6 +903,9 @@ class FlashMoE:
                 mlp.switch_mlp.remap = True
                 for name in ("up_gate_proj", "down_proj"):
                     sl = getattr(mlp.switch_mlp, name)
+                    if cache is not None:
+                        sl.attach_cache(cache, l_idx, "up_gate" if name == "up_gate_proj" else "down")
+                        continue
                     key_prefix = f"model.layers.{l_idx}.mlp.switch_mlp.{name}"
                     sl.init_resident(self.active, index, key_prefix, group_size)
         return self
@@ -909,8 +918,41 @@ def prepare_flash_moe(
     reselect_every: int = 256,
     enabled: bool = True,
     model_path: Optional[str] = None,
+    cache_size: int = 0,
 ):
     fm = FlashMoE(active=active, shared=shared, reselect_every=reselect_every, enabled=enabled)
+    if enabled and cache_size > 0:
+        from mlx_lm.models.switch_layers import (
+            ExpertSlotCache,
+            _SAFETENSORS_DTYPE,
+            _build_file_index,
+        )
+
+        args = model.args
+        qcfg = getattr(args, "quantization", None) or {}
+        group_size = qcfg.get("group_size", 128)
+        cache = ExpertSlotCache(args.num_hidden_layers, args.num_experts, cache_size)
+        index = _build_file_index(model_path) if model_path else None
+        if index is not None:
+            cache.set_file_index(index)
+            for l_idx in range(args.num_hidden_layers):
+                base = f"model.layers.{l_idx}.mlp.switch_mlp"
+                up_keys = [f"{base}.{p}.weight" for p in ("up_proj", "gate_proj")
+                           if f"{base}.{p}.weight" in index]
+                up_alpha = [f"{base}.{p}.row_alpha" for p in ("up_proj", "gate_proj")
+                            if f"{base}.{p}.row_alpha" in index]
+                down_keys = [f"{base}.down_proj.weight"]
+                down_alpha = [f"{base}.down_proj.row_alpha"]
+                cache.register_layer(l_idx, up_keys, up_alpha, down_keys, down_alpha)
+                if l_idx == 0:
+                    # up_gate: concat(up_proj, gate_proj) -> out_dim sum; down: unfused.
+                    _, _, dt_str, wshape = index[up_keys[0]]
+                    _, w_dt = _SAFETENSORS_DTYPE[dt_str]
+                    up_out = sum(index[k][3][1] for k in up_keys)
+                    down_out = index[down_keys[0]][3][1]
+                    cache.register_bank("up_gate", up_out, wshape[2], w_dt, group_size)
+                    cache.register_bank("down", down_out, index[down_keys[0]][3][2], w_dt, group_size)
+        fm.cache = cache
     return fm.attach(model, model_path=model_path)
 
 
