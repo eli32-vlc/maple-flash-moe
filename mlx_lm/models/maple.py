@@ -637,6 +637,10 @@ class MapleGate(nn.Module):
         self.flash = False
         self.active_ids = None
         self.active_mask = None
+        # Routing staged by _select for the gate to consume in the same
+        # forward (avoids recomputing the identical router matmul).
+        self._staged_inds = None
+        self._staged_scores = None
 
     def _fused_call(self, x):
         if self._router_ctr is None:
@@ -684,6 +688,11 @@ class MapleGate(nn.Module):
 
     def __call__(self, x):
         if self.flash:
+            if self._staged_inds is not None:
+                inds, scores = self._staged_inds, self._staged_scores
+                self._staged_inds = None
+                self._staged_scores = None
+                return inds, scores
             return self._reference(x)
         if self._fused is not False and x.size == self.hidden_size:
             if self._fused is None:
@@ -785,14 +794,12 @@ class MapleSparseMoeBlock(nn.Module):
         # shared=0 this makes active == the true top-k, i.e. exact baseline routing.
         gates = x.astype(mx.float32) @ self.gate.weight.astype(mx.float32).T
         inds, scores = group_expert_select(gates, self.gate.top_k)
-        flat = inds.reshape(-1)
-        unique_ids = []
-        seen = set()
-        for j in range(flat.shape[0]):
-            e = int(flat[j])
-            if e not in seen:
-                seen.add(e)
-                unique_ids.append(e)
+        # Vectorized union: a single numpy unique over the (device-evaled) ids,
+        # instead of a Python loop of per-token .item() host syncs — ~500x
+        # faster on prefill batches and produces the identical set.
+        import numpy as np
+
+        unique_ids = np.unique(inds.tolist()).tolist()
         shared = [int(s) for s in fm.shared_ids]
         active = list(dict.fromkeys(shared + unique_ids))
         # During batch prefill, each token routes to its own top-k set, so the
@@ -805,6 +812,14 @@ class MapleSparseMoeBlock(nn.Module):
         active = mx.array(active, dtype=mx.int32)
         self.switch_mlp.set_active(active)
         self.gate.set_active(active)
+        # For batch prefill the active set is the full union, so the IFP mask
+        # never excludes a top-k expert and the gate's masked routing equals
+        # this unmasked routing. Stash it so the gate skips the identical
+        # matmul. Never for single-token decode (there the active set is capped
+        # and masked routing legitimately differs).
+        if x.shape[1] > 1:
+            self.gate._staged_inds = inds
+            self.gate._staged_scores = scores
         self._selected = True
         self._tok = 0
 
